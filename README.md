@@ -1,164 +1,203 @@
-# ReLoRA -- PEFT Pretraining
-> Official code for Stack More Layers Differently: High-Rank Training Through Low-Rank Updates https://arxiv.org/abs/2307.05695
-<img width="813" alt="ReLoRA" src="https://github.com/Guitaricet/peft_pretraining/assets/2821124/41415bd0-b39f-4f2c-9bbd-5fd6555e87a7">
+# ReVeRA — Parameter-Efficient Pretraining through Low-Rank and High-Rank Adaptation
+
+> **Parameter-Efficient Pretraining through Low-Rank and High-Rank Adaptation Techniques**
+> Delyan Hristov · Mentor: Radostin Cholakov
+
+ReVeRA is a parameter-efficient **pre-training** method that combines the ideas of
+[VeRA](https://arxiv.org/abs/2310.11454) and [ReLoRA](https://arxiv.org/abs/2307.05695).
+Like VeRA, it keeps a single pair of low-rank matrices `A` and `B` **frozen and shared across all
+layers**, and only trains two small scaling vectors `Λ_b` and `Λ_d` (treated as diagonal matrices).
+Like ReLoRA, these adapters are **merged into the frozen weights and re-initialized** every few
+thousand steps, which turns a sequence of low-rank updates into a high-rank update:
+
+```
+ΔW = α·Λ¹_b A Λ¹_d B + α·Λ²_b A Λ²_d B + ··· + α·Λᴺ_b A Λᴺ_d B
+```
+
+where `α = ReVeRA_alpha / r`. Because only the scaling vectors are trainable, ReVeRA uses **far
+fewer trainable parameters than ReLoRA** (e.g. ~13.8K vs. ~1.57M at `r = 64` on BERT-medium),
+which makes it attractive when memory is the binding constraint and you are willing to trade some
+accuracy for it.
+
+This repository is a fork of the official ReLoRA codebase
+([Guitaricet/peft_pretraining](https://github.com/Guitaricet/peft_pretraining)), adapted to train
+**BERT-medium** with masked language modeling on the **C4** corpus. The training loop, the
+merge-and-reinitialize logic, and the cyclical cosine learning-rate schedule are inherited from
+ReLoRA, so most of the ReLoRA flags below still apply.
+
+> **Note on naming:** the code keeps ReLoRA's original argument names. When training ReVeRA,
+> `--lora_r` is the rank `r`, `--lora_alpha` is `ReVeRA_alpha`, and `--relora` / `--cycle_length`
+> control how often the adapters are merged and reset.
 
 ## Setup
 
-Requires Python 3.10+ (due to param annotaitons style) and PyTorch 2.0+ (for flash attention).
-All requirements are listed in `requirements.txt` and kept up-to-date.
+Requires Python 3.10+ and a recent PyTorch.
 
 ```bash
 pip install -e .
-pip install flash-attn
 ```
 
-> We do not have flash attention in our requirements, because for some reason flash attention installation script requires torch and some other requirements to already be installed
+All requirements are listed in `requirements.txt`.
 
-## 1B training script
+## How it works
 
-The rule of thumb of selecting the learning rate I use for now is 2X regular training learning rate.
-It might require tuning on larger models.
-Microbatch size depends on the GPU memory and needs to be tuned to maximize the throughput.
-Note that relora allows to use larger microbatch sizes than regular training.
+- The adapters are injected into the attention `query`, `key`, and `value` layers.
+- `A` and `B` are Kaiming-initialized and frozen; the scaling vectors are initialized so the
+  adapter output is zero at the start of each cycle (`Λ_b = 0`, `Λ_d = 10⁻¹`), so the model behaves
+  exactly like the base model right after every reset.
+- Every `--relora` update steps the adapters are merged into the frozen weights, a percentage of
+  the optimizer state is reset, the learning rate is dropped to ~0 and warmed back up over
+  `--restart_warmup_steps` (see the cyclical schedule below). This is what produces the high-rank
+  update.
 
-Number of steps is 143K (Pythia) minus 10K, because we start from the checkpoint at 10K steps.
-Relora reset frequency is 5320 so that the number of steps is would be divisible by it.
+## 1. Pre-process the data
 
-```bash
-torchrun --nproc-per-node 8 --nnodes 1 torchrun_main.py --training_config training_configs/1B_v1.0.yaml
-```
-
-## Usage
-
-Pre-process data (might take some time)
+C4 is tokenized ahead of time with the BERT-medium tokenizer:
 
 ```bash
 python pretokenize.py \
     --save_dir preprocessed_data \
-    --tokenizer t5-base \
+    --tokenizer prajjwal1/bert-medium \
     --dataset c4 \
     --dataset_config en \
     --text_field text \
     --sequence_length 512
 ```
 
-The script will log where the pre-processed data is saved. It should be something like `preprocessed_data/<dataset>_<tokenizer>_<sequence_length>`.
+The script logs where the pre-processed data is saved (something like
+`preprocessed_data/c4_prajjwal1-bert-medium_512`). Point `--dataset_path` at that directory when
+training.
 
-To train a model using ReLoRA, first, perform a warmup through regular training.
+## 2. Pre-train with ReVeRA
+
+Passing `--model_name_or_path` (any value, e.g. `bert_c4`) builds the hardcoded BERT-medium
+configuration (hidden size 512, 8 layers, 8 heads) and trains it with masked language modeling.
+Enable the adapters with `--use_peft True`.
 
 ```bash
 export DATA_PATH=<path to preprocessed data>
 
-torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
-    --model_config configs/llama_250m.json \
+torchrun --nproc_per_node=1 torchrun_main.py \
+    --model_name_or_path bert_c4 \
     --dataset_path $DATA_PATH \
-    --batch_size 24 \
-    --total_batch_size 1152 \
-    --lr 5e-4 \
-    --max_length 512 \
-    --save_every 1000 \
-    --eval_every 1000 \
-    --num_training_steps 20000
-    --tags warm_start_250M
-```
-
-> **Reproducibility note:** The way we ran the experiments in the paper was by specifying full num_training_steps, including both the warmup and the ReLoRA training, and stopping it after the desired number of steps was completed. Providing only the number of training steps should work too. The only difference will be the LR schedule during the warmup period.
-
-When you have a warmed-up network checkpoint, run the script with ReLoRA enabled. Note that we use a larger LR during the ReLoRA stage.
-
-Train with PEFT
-```bash
-torchrun --nproc-per-node <N_GPUS> torchrun_main.py \
-    --model_config configs/llama_250m.json \
-    --batch_size 24 \
-    --total_batch_size 1152 \
-    --lr 1e-3 \
-    --max_length 512 \
-    --use_peft \
-    --relora 5000 \
-    --cycle_length 5000 \
-    --restart_warmup_steps 100 \
+    --use_peft True \
+    --lora_r 64 \
+    --lora_alpha 64 \
+    --relora 15625 \
+    --cycle_length 15625 \
     --scheduler cosine_restarts \
-    --warmup_steps 500 \
-    --reset_optimizer_on_relora True \
-    --num_training_steps 20000 \
-    --save_every 5000 \
-    --eval_every 5000 \
-    --warmed_up_model checkpoints/llama_250m-2023-06-09-11-29-56/model_5000 \
-    --tags relora_250M
-```
-
-
-
-## Note on batch sizes
-
-To minimize the pain with multi-GPU setups, we recommend avoiding using `--gradient_accumulation` option directly. Instead, specify `--total_batch_size` and allow the script to figure out the gradient accumulation option based on `--batch_size` and the number of GPUs used.
-
-## Relora
-
-Relora integrates existing LoRA parameters into the main network and resets them.
-In principle, such an approach can be more flexible than LoRA, but you need to be careful with
-
-1. Optimizer states
-2. Learning rate schedule during and right after the reset
-3. How frequently you reset
-
-Reset frequency is determined by `--relora` parameter (in the number of update steps, not global steps).
-Optimizer reset options are: 
-```
-"--reset_optimizer_on_relora", default=True, type=lambda x: x.lower() == "true"
-"--optimizer_random_pruning", default=False, type=float
-"--optimizer_magnitude_pruning", default=False, type=float
-```
-
-We found that using `--optimizer_magnitude_pruning 0.9` or plain `--reset_optimizer_on_relora` usually performs well.
-Note that `--reset_optimizer_on_relora is True by default` and you need to provide `--reset_optimizer_on_relora False --optimizer_magnitude_pruning 0.9` if you want to do magnitude pruning.
-
-ReLoRA currently only supports cosine decay learning rate scheduler.
-Specifically `cosine_restarts` that works in cyclical mode that repeats the warmup every `--cycle_length` update steps.
-
-## Warm starts
-
-You can start LoRa from a partially trained checkpoint. To do that, provide `--warmed_up_model` option. For example:
-
-```
-torchrun torchrun_main.py ... <other options> .. --warmed_up_model checkpoints/llama_1b-2023-05-05-20-12-43/model_1000
-```
-
-## Distributed training
-
-We support single-node distributed training using vanilla PyTorch DDP.
-| `main.py` script does not have all features required for relora and will be deleted soon. We recommend to use `torchrun --nproc-per-node 1` for a single-GPU training.
-
-An example of using torchrun
-```bash
-torchrun --nproc-per-node 8 torchrun_main.py \
-    --model_config configs/llama_35m.json \
-    --use_peft \
-    --lora_r 128 \
-    --relora 500 \
-    --cycle_length 500 \
-    --warmup_steps 250 \
+    --warmup_steps 9000 \
+    --restart_warmup_steps 500 \
     --reset_optimizer_on_relora False \
-    --lr 0.001 \
-    --batch_size 60 \
-    --total_batch_size 480 \
-    --num_training_steps 5000 \
-    --save_every 5000 \
-    --dtype bfloat16 \
-    --tags relora_debug,example
+    --optimizer_magnitude_pruning 0.9 \
+    --lr 1e-3 \
+    --weight_decay 0.02 \
+    --batch_size 64 \
+    --max_length 512 \
+    --num_training_steps 62500 \
+    --eval_every 3500 \
+    --save_every 600000 \
+    --seed 42 \
+    --workers 4 \
+    --tags revera_bert_medium
 ```
 
-Where `--nproc-per-node` is the nubmer of GPUs you are using.
+To train a plain **VeRA** baseline (no merging/resetting), set `--use_peft True` with
+`--scheduler linear` and `--relora` equal to the total number of steps so no reset happens. To
+train the **ReLoRA / LoRA** baselines, use the original ReLoRA implementation with trainable `A`/`B`.
+
+## Hyperparameters
+
+The optimal configuration reported in the paper (BERT-medium, `r = 64`, batch size 64,
+bfloat16):
+
+| Hyperparameter        | Value  | CLI flag                  |
+| --------------------- | ------ | ------------------------- |
+| learning rate         | 3e-3   | `--lr`                    |
+| weight decay          | 2e-2   | `--weight_decay`          |
+| warmup steps          | 9000   | `--warmup_steps`          |
+| cycle length          | 15625  | `--cycle_length` / `--relora` |
+| restart warmup steps  | 500    | `--restart_warmup_steps`  |
+| ReVeRA alpha          | 256    | `--lora_alpha`            |
+| ReVeRA dropout        | 0.1    | (adapter default)         |
+
+`cycle length` is the number of steps between each merge-and-reinitialize of the adapters;
+`restart warmup steps` is the warmup applied right after every merge.
+
+## Optimizer resets and the LR schedule
+
+These are inherited from ReLoRA and matter for getting a genuine high-rank update:
+
+1. **Optimizer state** — resetting it prevents Adam's stored moments from cancelling the effect of
+   the reset. Options:
+   ```
+   --reset_optimizer_on_relora   (default True)
+   --optimizer_random_pruning    (float, default 0.0)
+   --optimizer_magnitude_pruning (float, default 0.0)
+   ```
+   The runs in this project use `--reset_optimizer_on_relora False --optimizer_magnitude_pruning 0.9`.
+2. **Learning rate** — ReVeRA only supports `--scheduler cosine_restarts`, which drops the LR to ~0
+   at each reset and warms it back up over `--restart_warmup_steps` (see figure in the paper).
+3. **Reset frequency** — set by `--relora` (in update steps).
+
+## Results
+
+C4 pre-training, `r = 64`, bfloat16, evaluated by perplexity (lower is better):
+
+| Method  | Trainable params | Perplexity |
+| ------- | ---------------- | ---------- |
+| LoRA    | 1572.8K          | 30.40      |
+| ReLoRA  | 1572.8K          | **18.41**  |
+| VeRA    | 13.8K            | 78.59      |
+| ReVeRA  | 13.8K            | 45.93      |
+
+ReVeRA clearly beats plain VeRA (confirming that merging yields a high-rank update) and uses two
+orders of magnitude fewer trainable parameters than ReLoRA, at the cost of some perplexity.
+
+Trainable-parameter counts scale favorably with model size — see Table 1 in the paper (e.g. on
+GPT-3, ReVeRA stays ~3.5M trainable across `r ∈ {16, 64, 256}`, while ReLoRA grows from 67.8M to
+1811.9M).
+
+## Fine-tuning
+
+As with ReLoRA, the merge-and-reinitialize process was found **not** to help for fine-tuning. On the
+GLUE/COLA task with T5-base (`run_glue.py`), ReVeRA slightly underperforms plain VeRA across
+`r ∈ {256, 512, 1024}` (see Appendix B of the paper). ReVeRA is intended for **pre-training**.
+
+## Acknowledgments
+
+This work builds directly on [ReLoRA](https://arxiv.org/abs/2307.05695) and
+[VeRA](https://arxiv.org/abs/2310.11454). Thanks to Radostin Cholakov for proposing the topic and
+for guidance, and to Nikola Gyulev, Delyan Boychev, and Emiliana Dimitrova for feedback. The
+America for Bulgaria and Beautiful Science foundations partially funded the compute, and the Google
+ML Developer Programs team provided Google Cloud and Colab credits.
 
 ## Citation
 
+If you use this work, please cite the ReVeRA report along with the ReLoRA and VeRA papers it builds
+on:
+
 ```
+@misc{hristov_revera,
+    title={Parameter-Efficient Pretraining through Low-Rank and High-Rank Adaptation Techniques},
+    author={Delyan Hristov},
+    note={Mentor: Radostin Cholakov}
+}
+
 @misc{lialin2023stack,
     title={Stack More Layers Differently: High-Rank Training Through Low-Rank Updates},
     author={Vladislav Lialin and Namrata Shivagunde and Sherin Muckatira and Anna Rumshisky},
     year={2023},
     eprint={2307.05695},
+    archivePrefix={arXiv},
+    primaryClass={cs.CL}
+}
+
+@misc{kopiczko2024vera,
+    title={VeRA: Vector-based Random Matrix Adaptation},
+    author={Dawid J. Kopiczko and Tijmen Blankevoort and Yuki M. Asano},
+    year={2024},
+    eprint={2310.11454},
     archivePrefix={arXiv},
     primaryClass={cs.CL}
 }
